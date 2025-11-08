@@ -37,7 +37,6 @@ class AbstractUNet(nn.Module):
             'area' (InterpolateUpsampling), 'deconv' (TransposeConvUpsampling), or None (no upsampling).
             Default: 'default' (chooses automatically).
         dropout_prob: Dropout probability. Default: 0.1.
-        is3d: If True the model is 3D, otherwise 2D. Default: True.
     """
 
     def __init__(
@@ -58,7 +57,6 @@ class AbstractUNet(nn.Module):
         conv_upscale=2,
         upsample="default",
         dropout_prob=0.1,
-        is3d=True,
     ):
         super().__init__()
 
@@ -82,7 +80,6 @@ class AbstractUNet(nn.Module):
             layer_order,
             num_groups,
             pool_kernel_size,
-            is3d,
             basic_module_kwargs=basic_module_kwargs,
         )
 
@@ -96,15 +93,11 @@ class AbstractUNet(nn.Module):
             num_groups,
             upsample,
             dropout_prob,
-            is3d,
             basic_module_kwargs=basic_module_kwargs,
         )
 
         # in the last layer a 1×1 convolution reduces the number of output channels to the number of labels
-        if is3d:
-            self.final_conv = nn.Conv3d(f_maps[0], out_channels, 1)
-        else:
-            self.final_conv = nn.Conv2d(f_maps[0], out_channels, 1)
+        self.final_conv = nn.Conv3d(f_maps[0], out_channels, 1)
 
         if is_segmentation:
             # semantic segmentation problem
@@ -121,7 +114,7 @@ class AbstractUNet(nn.Module):
         Forward pass through the network.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (N, C, D, H, W) for 3D or (N, C, H, W) for 2D,
+            x (torch.Tensor): Input tensor of shape (N, C, D, H, W),
                               where N is the batch size, C is the number of channels,
                               D is the depth, H is the height, and W is the width.
             time_emb (torch.Tensor, optional): Optional conditioning embedding broadcast to
@@ -204,7 +197,6 @@ class UNet3D(AbstractUNet):
             conv_upscale=conv_upscale,
             upsample=upsample,
             dropout_prob=dropout_prob,
-            is3d=True,
         )
 
 
@@ -248,7 +240,6 @@ class ResidualUNet3D(AbstractUNet):
             conv_upscale=conv_upscale,
             upsample=upsample,
             dropout_prob=dropout_prob,
-            is3d=True,
         )
 
 
@@ -292,47 +283,6 @@ class ResidualUNetSE3D(AbstractUNet):
             conv_upscale=conv_upscale,
             upsample=upsample,
             dropout_prob=dropout_prob,
-            is3d=True,
-        )
-
-
-class UNet2D(AbstractUNet):
-    """2D U-Net model from "U-Net: Convolutional Networks for Biomedical Image Segmentation".
-
-    Reference: https://arxiv.org/abs/1505.04597
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        final_sigmoid=True,
-        f_maps=64,
-        layer_order="gcr",
-        num_groups=8,
-        num_levels=4,
-        is_segmentation=True,
-        conv_padding=1,
-        conv_upscale=2,
-        upsample="default",
-        dropout_prob=0.1,
-        **kwargs,
-    ):
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            final_sigmoid=final_sigmoid,
-            basic_module=DoubleConv,
-            f_maps=f_maps,
-            layer_order=layer_order,
-            num_groups=num_groups,
-            num_levels=num_levels,
-            is_segmentation=is_segmentation,
-            conv_padding=conv_padding,
-            conv_upscale=conv_upscale,
-            upsample=upsample,
-            dropout_prob=dropout_prob,
-            is3d=False,
         )
 
 
@@ -403,7 +353,6 @@ class DiffusionUNet3D(AbstractUNet):
             conv_upscale=conv_upscale,
             upsample=upsample,
             dropout_prob=dropout_prob,
-            is3d=True,
             **kwargs,
         )
 
@@ -425,52 +374,6 @@ class DiffusionUNet3D(AbstractUNet):
         return super().forward(x, time_emb=time_emb, return_logits=return_logits)
 
 
-class ResidualUNet2D(AbstractUNet):
-    """Residual 2D U-Net model implementation.
-
-    Reference: https://arxiv.org/pdf/1706.00120.pdf
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        final_sigmoid=True,
-        f_maps=64,
-        layer_order="gcr",
-        num_groups=8,
-        num_levels=5,
-        is_segmentation=True,
-        conv_padding=1,
-        conv_upscale=2,
-        upsample="default",
-        dropout_prob=0.1,
-        **kwargs,
-    ):
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            final_sigmoid=final_sigmoid,
-            basic_module=ResNetBlock,
-            f_maps=f_maps,
-            layer_order=layer_order,
-            num_groups=num_groups,
-            num_levels=num_levels,
-            is_segmentation=is_segmentation,
-            conv_padding=conv_padding,
-            conv_upscale=conv_upscale,
-            upsample=upsample,
-            dropout_prob=dropout_prob,
-            is3d=False,
-        )
-
-
 def get_model(model_config):
     model_class = get_class(model_config["name"], modules=["pytorch3dunet.unet3d.model"])
     return model_class(**model_config)
-
-
-def is_model_2d(model):
-    if isinstance(model, nn.DataParallel):
-        model = model.module
-    return isinstance(model, UNet2D)
