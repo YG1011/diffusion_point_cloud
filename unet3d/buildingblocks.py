@@ -135,7 +135,7 @@ class SingleConv(nn.Sequential):
             self.add_module(name, module)
 
 
-class DoubleConv(nn.Sequential):
+class DoubleConv(nn.Module):
     """
     A module consisting of two consecutive convolution layers. We use 2x (Conv3d+ReLU+GroupNorm3d) by default.
     This can be changed however by providing the 'order' argument, e.g. in order
@@ -158,6 +158,7 @@ class DoubleConv(nn.Sequential):
         upscale (int): number of the convolution to upscale in encoder if DoubleConv, default: 2
         dropout_prob (float or tuple): dropout probability for each convolution, default 0.1
         is3d (bool): if True use Conv3d instead of Conv2d layers
+        time_emb_dim (int, optional): dimension of time embeddings injected into the block.
     """
 
     def __init__(
@@ -172,6 +173,7 @@ class DoubleConv(nn.Sequential):
         upscale=2,
         dropout_prob=0.1,
         is3d=True,
+        time_emb_dim=None,
     ):
         super().__init__()
         if encoder:
@@ -197,34 +199,49 @@ class DoubleConv(nn.Sequential):
         else:
             dropout_prob1 = dropout_prob2 = dropout_prob
 
-        # conv1
-        self.add_module(
-            "SingleConv1",
-            SingleConv(
-                conv1_in_channels,
-                conv1_out_channels,
-                kernel_size,
-                order,
-                num_groups,
-                padding=padding,
-                dropout_prob=dropout_prob1,
-                is3d=is3d,
-            ),
+        self.conv1 = SingleConv(
+            conv1_in_channels,
+            conv1_out_channels,
+            kernel_size,
+            order,
+            num_groups,
+            padding=padding,
+            dropout_prob=dropout_prob1,
+            is3d=is3d,
         )
-        # conv2
-        self.add_module(
-            "SingleConv2",
-            SingleConv(
-                conv2_in_channels,
-                conv2_out_channels,
-                kernel_size,
-                order,
-                num_groups,
-                padding=padding,
-                dropout_prob=dropout_prob2,
-                is3d=is3d,
-            ),
+        self.conv2 = SingleConv(
+            conv2_in_channels,
+            conv2_out_channels,
+            kernel_size,
+            order,
+            num_groups,
+            padding=padding,
+            dropout_prob=dropout_prob2,
+            is3d=is3d,
         )
+
+        self.supports_time_conditioning = time_emb_dim is not None
+        if self.supports_time_conditioning:
+            self.time_emb_proj1 = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, conv1_out_channels))
+            self.time_emb_proj2 = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, conv2_out_channels))
+        else:
+            self.time_emb_proj1 = None
+            self.time_emb_proj2 = None
+
+    def _apply_time_embedding(self, x, time_emb_layer, time_emb):
+        if time_emb_layer is None or time_emb is None:
+            return x
+        emb = time_emb_layer(time_emb)
+        while emb.ndim < x.ndim:
+            emb = emb.unsqueeze(-1)
+        return x + emb
+
+    def forward(self, x, time_emb=None):
+        x = self.conv1(x)
+        x = self._apply_time_embedding(x, self.time_emb_proj1, time_emb)
+        x = self.conv2(x)
+        x = self._apply_time_embedding(x, self.time_emb_proj2, time_emb)
+        return x
 
 
 class ResNetBlock(nn.Module):
@@ -341,6 +358,7 @@ class Encoder(nn.Module):
         pool_kernel_size=2,
         pool_type="max",
         basic_module=DoubleConv,
+        basic_module_kwargs=None,
         conv_layer_order="gcr",
         num_groups=8,
         padding=1,
@@ -364,6 +382,7 @@ class Encoder(nn.Module):
         else:
             self.pooling = None
 
+        module_kwargs = dict(basic_module_kwargs or {})
         self.basic_module = basic_module(
             in_channels,
             out_channels,
@@ -375,12 +394,17 @@ class Encoder(nn.Module):
             upscale=upscale,
             dropout_prob=dropout_prob,
             is3d=is3d,
+            **module_kwargs,
         )
+        self.supports_time_conditioning = getattr(self.basic_module, "supports_time_conditioning", False)
 
-    def forward(self, x):
+    def forward(self, x, time_emb=None):
         if self.pooling is not None:
             x = self.pooling(x)
-        x = self.basic_module(x)
+        if time_emb is not None and self.supports_time_conditioning:
+            x = self.basic_module(x, time_emb=time_emb)
+        else:
+            x = self.basic_module(x)
         return x
 
 
@@ -423,6 +447,7 @@ class Decoder(nn.Module):
         upsample="default",
         dropout_prob=0.1,
         is3d=True,
+        basic_module_kwargs=None,
     ):
         super().__init__()
 
@@ -467,6 +492,7 @@ class Decoder(nn.Module):
         if adapt_channels is True:
             in_channels = out_channels
 
+        module_kwargs = dict(basic_module_kwargs or {})
         self.basic_module = basic_module(
             in_channels,
             out_channels,
@@ -477,12 +503,17 @@ class Decoder(nn.Module):
             padding=padding,
             dropout_prob=dropout_prob,
             is3d=is3d,
+            **module_kwargs,
         )
+        self.supports_time_conditioning = getattr(self.basic_module, "supports_time_conditioning", False)
 
-    def forward(self, encoder_features, x):
+    def forward(self, encoder_features, x, time_emb=None):
         x = self.upsampling(encoder_features=encoder_features, x=x)
         x = self.joining(encoder_features, x)
-        x = self.basic_module(x)
+        if time_emb is not None and self.supports_time_conditioning:
+            x = self.basic_module(x, time_emb=time_emb)
+        else:
+            x = self.basic_module(x)
         return x
 
     @staticmethod
@@ -505,6 +536,7 @@ def create_encoders(
     num_groups,
     pool_kernel_size,
     is3d,
+    basic_module_kwargs=None,
 ):
     # create encoder path consisting of Encoder modules. Depth of the encoder is equal to `len(f_maps)`
     encoders = []
@@ -523,6 +555,7 @@ def create_encoders(
                 upscale=conv_upscale,
                 dropout_prob=dropout_prob,
                 is3d=is3d,
+                basic_module_kwargs=basic_module_kwargs,
             )
         else:
             encoder = Encoder(
@@ -537,6 +570,7 @@ def create_encoders(
                 upscale=conv_upscale,
                 dropout_prob=dropout_prob,
                 is3d=is3d,
+                basic_module_kwargs=basic_module_kwargs,
             )
 
         encoders.append(encoder)
@@ -545,7 +579,16 @@ def create_encoders(
 
 
 def create_decoders(
-    f_maps, basic_module, conv_kernel_size, conv_padding, layer_order, num_groups, upsample, dropout_prob, is3d
+    f_maps,
+    basic_module,
+    conv_kernel_size,
+    conv_padding,
+    layer_order,
+    num_groups,
+    upsample,
+    dropout_prob,
+    is3d,
+    basic_module_kwargs=None,
 ):
     # create decoder path consisting of the Decoder modules. The length of the decoder list is equal to `len(f_maps) - 1`
     decoders = []
@@ -569,6 +612,7 @@ def create_decoders(
             upsample=upsample,
             dropout_prob=dropout_prob,
             is3d=is3d,
+            basic_module_kwargs=basic_module_kwargs,
         )
         decoders.append(decoder)
     return nn.ModuleList(decoders)
