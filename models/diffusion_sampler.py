@@ -71,24 +71,43 @@ class DiffusionSampler:
         alpha_bar = alpha_bar.view(batch_size, 1, 1)
         return (x_t - torch.sqrt(alpha_bar) * x0) / torch.sqrt(1 - alpha_bar)
 
-    def sample(
+    def purify(
         self,
         x_adv: torch.Tensor,
         context: Optional[torch.Tensor],
         num_steps: Optional[int] = None,
+        start_step: Optional[int] = None,
         flexibility: float = 0.0,
         return_intermediates: bool = False,
     ):
-        """Generates samples guided by the reference adversarial example."""
+        """Runs diffusion purification starting from a forward-noised adversarial input."""
 
         device = x_adv.device
         batch_size, num_points, _ = x_adv.shape
 
-        start_t = self.var_sched.num_steps if num_steps is None else int(num_steps)
+        if start_step is None:
+            if self.forward_noise_steps is not None:
+                start_t = int(self.forward_noise_steps)
+            elif num_steps is not None:
+                start_t = int(num_steps)
+            else:
+                start_t = self.var_sched.num_steps
+        else:
+            start_t = int(start_step)
+
         if start_t <= 0 or start_t > self.var_sched.num_steps:
             raise ValueError(
-                "num_steps must be in the range [1, var_sched.num_steps]"
+                "start_step must lie in the range [1, var_sched.num_steps]"
             )
+
+        if num_steps is None:
+            stop_t = 0
+        else:
+            if num_steps <= 0:
+                raise ValueError("num_steps must be positive when provided")
+            if num_steps > start_t:
+                raise ValueError("num_steps cannot exceed start_step")
+            stop_t = start_t - num_steps
 
         reference_voxel, reference_transform = self.pointcloud_to_voxel(x_adv)
         reference_voxel = reference_voxel.detach()
@@ -101,7 +120,7 @@ class DiffusionSampler:
         x_t = self.get_noised_x(x_adv, start_t, noise=noise)
 
         intermediates = {}
-        for t in range(start_t, 0, -1):
+        for t in range(start_t, stop_t, -1):
             z = torch.randn_like(x_t) if t > 1 else torch.zeros_like(x_t)
             alpha = self.var_sched.alphas[t].to(device=device, dtype=x_adv.dtype)
             alpha_bar_t = self.var_sched.alpha_bars[t].to(device=device, dtype=x_adv.dtype)
@@ -130,4 +149,23 @@ class DiffusionSampler:
             x_t = x_next
 
         return (x_t, intermediates) if return_intermediates else x_t
+
+    def sample(
+        self,
+        x_adv: torch.Tensor,
+        context: Optional[torch.Tensor],
+        num_steps: Optional[int] = None,
+        flexibility: float = 0.0,
+        return_intermediates: bool = False,
+    ):
+        """Backwards-compatible alias for :meth:`purify` supporting existing scripts."""
+
+        return self.purify(
+            x_adv=x_adv,
+            context=context,
+            num_steps=num_steps,
+            start_step=None,
+            flexibility=flexibility,
+            return_intermediates=return_intermediates,
+        )
 

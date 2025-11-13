@@ -54,6 +54,17 @@ class FrequencyMaskGenerator(nn.Module):
         self.register_buffer("_amplitude_mask", amplitude_mask, persistent=False)
         self.register_buffer("_phase_mask", phase_mask, persistent=False)
 
+        # Store the mask coverage so downstream modules can gauge how strong
+        # the frequency guidance should be. Hard replacement of the masked
+        # spectrum proved brittle when the voxel statistics were noisy, so we
+        # expose the average mask weight as a lightweight heuristic for
+        # blending in the spatial domain.
+        self.register_buffer(
+            "_amplitude_fraction",
+            amplitude_mask.float().mean(),
+            persistent=False,
+        )
+
     @staticmethod
     def _radial_grid(grid_size: Tuple[int, int, int]) -> torch.Tensor:
         device = torch.device("cpu")
@@ -94,6 +105,12 @@ class FrequencyMaskGenerator(nn.Module):
         h_a = self._amplitude_mask.to(device=device, dtype=dtype)
         h_p = self._phase_mask.to(device=device, dtype=dtype)
         return h_a, h_p
+
+    @property
+    def amplitude_fraction(self) -> float:
+        """Returns the mean weight of the amplitude mask."""
+
+        return float(self._amplitude_fraction)
 
 
 def amplitude_exchange(
@@ -150,5 +167,38 @@ class FrequencyGuidance(nn.Module):
         amplitude_guided = amplitude_exchange(amplitude_pred, amplitude_ref, h_a)
         phase_guided = phase_projection(phase_pred, phase_ref, h_p, self.phase_delta)
         guided_voxel = idft_3d(amplitude_guided, phase_guided)
+
+        # Project the reconstructed signal back to the non-negative range used
+        # by the voxel occupancies. Negative activations create artefacts when
+        # sampling points, so we drop them while keeping track of the overall
+        # energy so that we can later restore it.
+        guided_voxel = guided_voxel.clamp_min(0.0)
+
+        # Preserve the global statistics of the model prediction. Matching the
+        # total occupancy prevents the guidance from collapsing the voxel mass
+        # to a tiny subset of cells, which previously made the devoxelisation
+        # degrade into almost uniform noise.
+        pred_sum = predicted_voxel.sum(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
+        guided_sum = guided_voxel.sum(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
+        guided_voxel = guided_voxel * pred_sum / guided_sum
+
+        peak_pred = predicted_voxel.amax(dim=(-3, -2, -1), keepdim=True)
+        peak_guided = guided_voxel.amax(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
+        guided_voxel = guided_voxel * peak_pred / peak_guided
+
+        # Blend the guided reconstruction with the network prediction in the
+        # spatial domain. Rather than fully replacing the low-frequency
+        # content, we interpolate using the fraction of spectrum that is being
+        # modified. This keeps the update gentle when only a small subset of
+        # frequencies is constrained.
+        blend = predicted_voxel.new_tensor(self.mask_generator.amplitude_fraction)
+        guided_voxel = predicted_voxel + blend * (guided_voxel - predicted_voxel)
+
+        # The previous rescaling can push a few voxels slightly above the
+        # original dynamic range. Clamping brings the tensor back to a valid
+        # occupancy field while keeping a small epsilon to avoid returning an
+        # entirely empty grid.
+        guided_voxel = guided_voxel.clamp(min=0.0)
+
         return guided_voxel
 

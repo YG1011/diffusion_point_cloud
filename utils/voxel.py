@@ -135,35 +135,45 @@ class VoxelToPointCloud(nn.Module):
             num_points = total_voxels
 
         flat = voxels.view(batch_size, total_voxels)
-        weights = torch.where(flat > threshold, flat, torch.zeros_like(flat))
-        weights = weights.clamp_min_(0)
-
-        weight_sums = weights.sum(dim=-1, keepdim=True)
-        has_mass = weight_sums > 0
-        default_probs = flat.new_full((batch_size, total_voxels), 1.0 / total_voxels)
-        probs = torch.where(
-            has_mass,
-            weights / weight_sums.clamp_min_(1e-12),
-            default_probs,
-        )
-
-        indices = torch.multinomial(probs, num_samples=num_points, replacement=True)
+        outputs = []
 
         dz = h * w
         dy = w
-        iz = indices // dz
-        iy = (indices % dz) // dy
-        ix = indices % dy
-
-        coords = torch.stack([iz, iy, ix], dim=-1).to(dtype)
-        jitter = torch.rand_like(coords)
 
         grid_size = torch.tensor([d, h, w], dtype=dtype, device=device)
-        coords = (coords + jitter) / grid_size  # Normalised to [0, 1)
-
         mins = transform.mins
         ranges = transform.ranges
-        coords = coords.view(batch_size, num_points, 3)
-        points = coords * ranges + mins
-        return points
+
+        for b in range(batch_size):
+            weights = flat[b]
+            active = torch.nonzero(weights > threshold, as_tuple=False).squeeze(-1)
+
+            if active.numel() == 0:
+                active = torch.arange(total_voxels, device=device)
+                active_weights = torch.ones_like(active, dtype=dtype)
+            else:
+                active_weights = weights[active]
+
+            if active.numel() >= num_points:
+                topk = torch.topk(active_weights, num_points, largest=True, sorted=False)
+                chosen = active[topk.indices]
+            else:
+                chosen = active
+                deficit = num_points - active.numel()
+                probs = active_weights / active_weights.sum().clamp_min(1e-12)
+                extra = active[torch.multinomial(probs, deficit, replacement=True)]
+                chosen = torch.cat([chosen, extra], dim=0)
+
+            iz = chosen // dz
+            iy = (chosen % dz) // dy
+            ix = chosen % dy
+
+            coords = torch.stack([iz, iy, ix], dim=-1).to(dtype)
+            jitter = torch.rand_like(coords)
+            coords = (coords + jitter) / grid_size
+
+            points = coords * ranges[b] + mins[b]
+            outputs.append(points)
+
+        return torch.stack(outputs, dim=0)
 

@@ -292,6 +292,7 @@ def evaluate(
     input_field: str,
     context_field: str,
     compare_field: Optional[str],
+    forward_noise_steps: Optional[int],
     diffusion_steps: Optional[int],
     flexibility: float,
     save_path: Optional[Path],
@@ -330,9 +331,10 @@ def evaluate(
             baseline_correct += (logits_baseline.argmax(dim=1) == labels).sum().item()
 
             latents = autoencoder.encode(context_points)
-            purified = sampler.sample(
+            purified = sampler.purify(
                 x_adv=points,
                 context=latents,
+                start_step=forward_noise_steps,
                 num_steps=diffusion_steps,
                 flexibility=flexibility,
             )
@@ -404,6 +406,7 @@ def main() -> None:
         input_field=args.input_field,
         context_field=context_field,
         compare_field=args.compare_field,
+        forward_noise_steps=args.forward_noise_steps,
         diffusion_steps=args.diffusion_steps,
         flexibility=args.sampler_flexibility,
         save_path=args.save_purified,
