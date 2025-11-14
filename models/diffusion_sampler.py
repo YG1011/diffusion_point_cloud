@@ -1,4 +1,4 @@
-"""Diffusion sampler with frequency-domain guidance for point clouds."""
+"""Diffusion sampler with graph-frequency guidance for point clouds."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from typing import Optional
 import torch
 
 from .diffusion import VarianceSchedule
-from utils.frequency import FrequencyGuidance
-from utils.voxel import PointCloudToVoxel, VoxelToPointCloud, VoxelTransform
+from utils.graph_frequency import GraphFrequencyGuidance
 
 
 class DiffusionSampler:
@@ -18,15 +17,11 @@ class DiffusionSampler:
         self,
         model,
         var_sched: VarianceSchedule,
-        pointcloud_to_voxel: PointCloudToVoxel,
-        voxel_to_pointcloud: VoxelToPointCloud,
-        frequency_guidance: FrequencyGuidance,
+        frequency_guidance: GraphFrequencyGuidance,
         forward_noise_steps: Optional[int] = None,
     ) -> None:
         self.model = model
         self.var_sched = var_sched
-        self.pointcloud_to_voxel = pointcloud_to_voxel
-        self.voxel_to_pointcloud = voxel_to_pointcloud
         self.frequency_guidance = frequency_guidance
         self.forward_noise_steps = forward_noise_steps
 
@@ -83,7 +78,7 @@ class DiffusionSampler:
         """Runs diffusion purification starting from a forward-noised adversarial input."""
 
         device = x_adv.device
-        batch_size, num_points, _ = x_adv.shape
+        batch_size = x_adv.size(0)
 
         if start_step is None:
             if self.forward_noise_steps is not None:
@@ -109,12 +104,7 @@ class DiffusionSampler:
                 raise ValueError("num_steps cannot exceed start_step")
             stop_t = start_t - num_steps
 
-        reference_voxel, reference_transform = self.pointcloud_to_voxel(x_adv)
-        reference_voxel = reference_voxel.detach()
-        reference_transform = VoxelTransform(
-            mins=reference_transform.mins.detach(),
-            ranges=reference_transform.ranges.detach(),
-        )
+        reference_points = x_adv.detach()
 
         noise = torch.randn_like(x_adv)
         x_t = self.get_noised_x(x_adv, start_t, noise=noise)
@@ -128,11 +118,7 @@ class DiffusionSampler:
             sigma = torch.as_tensor(sigma, device=device, dtype=x_adv.dtype).view(1, 1, 1)
 
             x0_pred = self._predict_x0(x_t, t, context)
-            voxel_pred, _ = self.pointcloud_to_voxel(x0_pred, transform=reference_transform)
-            guided_voxel = self.frequency_guidance(voxel_pred, reference_voxel)
-            x0_guided = self.voxel_to_pointcloud(
-                guided_voxel, reference_transform, num_points=num_points
-            )
+            x0_guided = self.frequency_guidance(x0_pred, reference_points)
 
             eps = self._predict_eps(
                 x_t,

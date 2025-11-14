@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -12,9 +12,8 @@ from torch.utils.data import DataLoader
 from models.autoencoder import AutoEncoder
 from models.dgcnn import build_dgcnn_classifier
 from models.diffusion_sampler import DiffusionSampler
-from utils.frequency import FrequencyGuidance, FrequencyMaskGenerator
+from utils.graph_frequency import GraphFrequencyGuidance
 from utils.modelnet40 import ModelNet40
-from utils.voxel import PointCloudToVoxel, VoxelToPointCloud
 from .datasets import AdversarialExamplesDataset
 
 
@@ -77,29 +76,31 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint produced by train_ae.py containing the diffusion model.",
     )
     parser.add_argument(
-        "--grid-size",
+        "--graph-k",
         type=int,
-        nargs=3,
-        default=(64, 64, 64),
-        help="Spatial resolution of the voxel grid (default: 64 64 64).",
+        default=16,
+        help="Number of neighbours used to build the k-NN graph (default: 16).",
     )
     parser.add_argument(
-        "--amplitude-radius",
+        "--lowpass-ratio",
         type=float,
-        default=None,
-        help="Radius (in voxels) of the low-pass mask applied to amplitudes.",
+        default=0.125,
+        help=(
+            "Fraction (or absolute count when >= 1) of graph Fourier modes "
+            "replaced with the reference signal."
+        ),
     )
     parser.add_argument(
-        "--phase-radius",
+        "--gft-bandwidth",
         type=float,
         default=None,
-        help="Radius (in voxels) of the low-pass mask applied to phases.",
+        help="Optional Gaussian bandwidth controlling edge weights in the graph.",
     )
     parser.add_argument(
-        "--phase-delta",
+        "--guidance-blend",
         type=float,
         default=None,
-        help="Optional clipping range for phase correction (in radians).",
+        help="Optional blend weight overriding the adaptive guidance strength.",
     )
     parser.add_argument(
         "--forward-noise-steps",
@@ -218,40 +219,27 @@ def load_autoencoder(ckpt_path: Path, device: torch.device) -> AutoEncoder:
 
 def build_sampler(
     autoencoder: AutoEncoder,
-    grid_size: Tuple[int, int, int],
-    amplitude_radius: Optional[float],
-    phase_radius: Optional[float],
-    phase_delta: Optional[float],
+    graph_k: int,
+    lowpass_ratio: float,
+    guidance_blend: Optional[float],
+    gft_bandwidth: Optional[float],
     forward_noise_steps: Optional[int],
-) -> Tuple[DiffusionSampler, PointCloudToVoxel, VoxelToPointCloud]:
-    d, h, w = grid_size
-    if amplitude_radius is None:
-        amplitude_radius = min(d, h, w) / 4.0
-    if phase_radius is None:
-        phase_radius = amplitude_radius / 2.0
-
-    mask_generator = FrequencyMaskGenerator(
-        grid_size=grid_size,
-        amplitude_radius=amplitude_radius,
-        phase_radius=phase_radius,
+) -> DiffusionSampler:
+    frequency_guidance = GraphFrequencyGuidance(
+        k=graph_k,
+        lowpass_ratio=lowpass_ratio,
+        bandwidth=gft_bandwidth,
+        blend_weight=guidance_blend,
     )
-    frequency_guidance = FrequencyGuidance(
-        mask_generator=mask_generator, phase_delta=phase_delta
-    )
-
-    voxeliser = PointCloudToVoxel(grid_size=grid_size)
-    devoxeliser = VoxelToPointCloud(grid_size=grid_size)
 
     sampler = DiffusionSampler(
         model=autoencoder.diffusion.net,
         var_sched=autoencoder.diffusion.var_sched,
-        pointcloud_to_voxel=voxeliser,
-        voxel_to_pointcloud=devoxeliser,
         frequency_guidance=frequency_guidance,
         forward_noise_steps=forward_noise_steps,
     )
     autoencoder.diffusion.net.eval()
-    return sampler, voxeliser, devoxeliser
+    return sampler
 
 
 def build_dataloader(args: argparse.Namespace) -> DataLoader:
@@ -385,13 +373,12 @@ def main() -> None:
     classifier = load_classifier(args.weights, device)
     autoencoder = load_autoencoder(args.ae_checkpoint, device)
 
-    grid_size = tuple(int(v) for v in args.grid_size)
-    sampler, _, _ = build_sampler(
+    sampler = build_sampler(
         autoencoder=autoencoder,
-        grid_size=grid_size,
-        amplitude_radius=args.amplitude_radius,
-        phase_radius=args.phase_radius,
-        phase_delta=args.phase_delta,
+        graph_k=args.graph_k,
+        lowpass_ratio=args.lowpass_ratio,
+        guidance_blend=args.guidance_blend,
+        gft_bandwidth=args.gft_bandwidth,
         forward_noise_steps=args.forward_noise_steps,
     )
 
