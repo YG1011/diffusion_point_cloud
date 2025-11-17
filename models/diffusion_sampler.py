@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+from torch import nn
 
 from .diffusion import VarianceSchedule
 from utils.graph_frequency import GraphFrequencyGuidance

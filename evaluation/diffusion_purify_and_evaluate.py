@@ -276,7 +276,7 @@ def build_sampler(
         model=autoencoder.diffusion.net,
         var_sched=autoencoder.diffusion.var_sched,
         frequency_guidance=frequency_guidance,
-        forward_noise_steps=forward_noise_steps,
+        forward_noise_steps=args.forward_noise_steps,
     )
     autoencoder.diffusion.net.eval()
     return sampler
