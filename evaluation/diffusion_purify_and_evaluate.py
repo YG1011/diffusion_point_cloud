@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from models.autoencoder import AutoEncoder
 from models.dgcnn import build_dgcnn_classifier
 from models.diffusion_sampler import DiffusionSampler
-from utils.graph_frequency import GraphFrequencyGuidance
+from utils.spherical_harmonics import SphericalHarmonicGuidance
 from utils.modelnet40 import ModelNet40
 from .datasets import AdversarialExamplesDataset
 
@@ -76,25 +76,19 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint produced by train_ae.py containing the diffusion model.",
     )
     parser.add_argument(
-        "--graph-k",
+        "--sht-lmax",
         type=int,
-        default=16,
-        help="Number of neighbours used to build the k-NN graph (default: 16).",
+        default=32,
+        help="Maximum spherical harmonic degree used for the projection (default: 32).",
     )
     parser.add_argument(
-        "--lowpass-ratio",
+        "--sht-sigma",
         type=float,
-        default=0.125,
+        default=1.5,
         help=(
-            "Fraction (or absolute count when >= 1) of graph Fourier modes "
-            "replaced with the reference signal."
+            "Gaussian sigma controlling the low-pass filter applied in the spherical "
+            "harmonics domain."
         ),
-    )
-    parser.add_argument(
-        "--gft-bandwidth",
-        type=float,
-        default=None,
-        help="Optional Gaussian bandwidth controlling edge weights in the graph.",
     )
     parser.add_argument(
         "--guidance-blend",
@@ -219,24 +213,19 @@ def load_autoencoder(ckpt_path: Path, device: torch.device) -> AutoEncoder:
 
 def build_sampler(
     autoencoder: AutoEncoder,
-    graph_k: int,
-    lowpass_ratio: float,
-    guidance_blend: Optional[float],
-    gft_bandwidth: Optional[float],
-    forward_noise_steps: Optional[int],
+    args: argparse.Namespace,
 ) -> DiffusionSampler:
-    frequency_guidance = GraphFrequencyGuidance(
-        k=graph_k,
-        lowpass_ratio=lowpass_ratio,
-        bandwidth=gft_bandwidth,
-        blend_weight=guidance_blend,
+    frequency_guidance = SphericalHarmonicGuidance(
+        lmax=args.sht_lmax,
+        sigma=args.sht_sigma,
+        blend_weight=args.guidance_blend,
     )
 
     sampler = DiffusionSampler(
         model=autoencoder.diffusion.net,
         var_sched=autoencoder.diffusion.var_sched,
         frequency_guidance=frequency_guidance,
-        forward_noise_steps=forward_noise_steps,
+        forward_noise_steps=args.forward_noise_steps,
     )
     autoencoder.diffusion.net.eval()
     return sampler
@@ -373,14 +362,7 @@ def main() -> None:
     classifier = load_classifier(args.weights, device)
     autoencoder = load_autoencoder(args.ae_checkpoint, device)
 
-    sampler = build_sampler(
-        autoencoder=autoencoder,
-        graph_k=args.graph_k,
-        lowpass_ratio=args.lowpass_ratio,
-        guidance_blend=args.guidance_blend,
-        gft_bandwidth=args.gft_bandwidth,
-        forward_noise_steps=args.forward_noise_steps,
-    )
+    sampler = build_sampler(autoencoder=autoencoder, args=args)
 
     context_field = args.context_field if args.context_field is not None else args.input_field
 

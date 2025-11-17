@@ -221,3 +221,6 @@ class GraphFrequencyGuidance(nn.Module):
         blend_tensor = predicted_points.new_full((batch_size, 1, 1), blend)
 
         return predicted_points + blend_tensor * (guided_points - predicted_points)
+
+
+# ---------------------------------------------------------------------------
