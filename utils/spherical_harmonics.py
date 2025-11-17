@@ -1,9 +1,7 @@
-"""Spherical-harmonic utilities for point cloud diffusion guidance.
+"""Spherical harmonic utilities for diffusion guidance.
 
-The previous implementation relied on a graph Fourier transform (GFT). The
-GFT-based routines have been retained below in a commented block so the
-behaviour can be restored if needed, while the active implementation now uses
-the spherical harmonics workflow shared by the user.
+A self-contained implementation that mirrors the earlier inlined helpers while
+keeping the original GFT utilities available in :mod:`utils.graph_frequency`.
 """
 
 from __future__ import annotations
@@ -69,7 +67,7 @@ def _convert_pc_to_grid(pc: np.ndarray, lmax: int, device: str) -> tuple:
 
 
 def _convert_grid_to_pc(grid: pysh.SHGrid, flag: np.ndarray, origin: np.ndarray) -> np.ndarray:
-    """Reconstruct a point cloud from a spherical grid representation."""
+    """Reconstruct a point cloud from its spherical grid representation."""
 
     nlon = grid.nlon
     nlat = grid.nlat
@@ -95,16 +93,13 @@ def _convert_grid_to_pc(grid: pysh.SHGrid, flag: np.ndarray, origin: np.ndarray)
     return pc
 
 
-def _low_pass_filter(grid: pysh.SHGrid, sigma: float) -> pysh.SHGrid:
-    """Apply a Gaussian low-pass filter in the spherical harmonics domain."""
+def _gaussian_weights(degree_count: int, sigma: float) -> np.ndarray:
+    """Return positive Gaussian weights without zeroing any frequencies."""
 
-    clm = grid.expand()
-    weights = getGaussianKernel(clm.coeffs.shape[1] * 2 - 1, sigma)[
-        clm.coeffs.shape[1] - 1 :
-    ]
-    weights /= weights[0]
-    clm.coeffs *= weights
-    return clm.expand()
+    weights = getGaussianKernel(degree_count * 2 - 1, sigma)[degree_count - 1 :]
+    weights = weights.squeeze()
+    weights = weights / weights.max()
+    return weights
 
 
 def _duplicate_randomly(pc: np.ndarray, size: int) -> np.ndarray:
@@ -118,32 +113,54 @@ def _duplicate_randomly(pc: np.ndarray, size: int) -> np.ndarray:
     return np.concatenate((pc, dup))
 
 
-def spherical_harmonic_smooth(
-    pc: np.ndarray, lmax: int, sigma: float, target_size: int, device: str
-) -> np.ndarray:
-    """Project ``pc`` to spherical harmonics, low-pass filter, and reconstruct."""
+def spherical_harmonic_transform(
+    pc: np.ndarray, lmax: int, device: str
+) -> tuple[pysh.SHCoeffs, np.ndarray, np.ndarray]:
+    """Convert a point cloud to spherical harmonic coefficients without loss."""
 
     grid, flag, origin = _convert_pc_to_grid(pc, lmax, device)
-    smooth_grid = _low_pass_filter(grid, sigma)
-    smooth_pc = _convert_grid_to_pc(smooth_grid, flag, origin)
-    smooth_pc = _duplicate_randomly(smooth_pc, target_size)
-    return smooth_pc
+    coeffs = grid.expand()
+    return coeffs, flag, origin
 
 
-class GraphFrequencyGuidance(nn.Module):
-    """Guides diffusion updates using spherical harmonic smoothing.
+def inverse_spherical_harmonic(
+    coeffs: pysh.SHCoeffs, flag: np.ndarray, origin: np.ndarray
+) -> np.ndarray:
+    """Reconstruct a point cloud from spherical harmonic coefficients."""
 
-    The original GFT-based implementation is kept below for reference:
+    grid = coeffs.expand()
+    return _convert_grid_to_pc(grid, flag, origin)
 
-    .. code-block:: python
 
-        # def forward(self, predicted_points, reference_points):
-        #     ...
-        #     coeff_guided = torch.where(low_mask, ref_coeff, pred_coeff)
-        #     guided_centered = inverse_graph_fourier_transform(coeff_guided, eigenvectors)
-        #     ...
+def spherical_harmonic_exchange(
+    predicted_pc: np.ndarray,
+    reference_pc: np.ndarray,
+    lmax: int,
+    sigma: float,
+    blend_weight: float,
+    target_size: int,
+    device: str,
+) -> np.ndarray:
+    """Blend spectra without removing frequencies, inspired by Alg. 1."""
 
-    """
+    ref_coeffs, flag, origin = spherical_harmonic_transform(reference_pc, lmax, device)
+    pred_coeffs, _, _ = spherical_harmonic_transform(predicted_pc, lmax, device)
+
+    weights = _gaussian_weights(ref_coeffs.coeffs.shape[1], sigma)
+
+    ref_filtered = ref_coeffs.copy()
+    ref_filtered.coeffs = ref_filtered.coeffs * weights[None, :, None]
+
+    blended = pred_coeffs.copy()
+    blended.coeffs = (1.0 - blend_weight) * pred_coeffs.coeffs + blend_weight * ref_filtered.coeffs
+
+    guided_pc = inverse_spherical_harmonic(blended, flag, origin)
+    guided_pc = _duplicate_randomly(guided_pc, target_size)
+    return guided_pc
+
+
+class SphericalHarmonicGuidance(nn.Module):
+    """Guides diffusion updates using spherical harmonic spectrum exchange."""
 
     def __init__(
         self,
@@ -163,13 +180,13 @@ class GraphFrequencyGuidance(nn.Module):
 
         self.lmax = int(lmax)
         self.sigma = float(sigma)
-        self.blend_weight = blend_weight
+        self.blend_weight = 0.5 if blend_weight is None else float(blend_weight)
         self.target_size = target_size
 
     def forward(
         self, predicted_points: torch.Tensor, reference_points: torch.Tensor
     ) -> torch.Tensor:
-        """Smooth reference shapes via spherical harmonics and blend predictions."""
+        """Blend spectra of reference and predicted shapes without dropping modes."""
 
         if predicted_points.shape != reference_points.shape:
             raise ValueError("predicted_points and reference_points must share shape")
@@ -183,20 +200,17 @@ class GraphFrequencyGuidance(nn.Module):
         guided_points = []
         for b in range(batch_size):
             ref_np = reference_points[b].detach().cpu().numpy()
-            smoothed = spherical_harmonic_smooth(
-                ref_np,
+            pred_np = predicted_points[b].detach().cpu().numpy()
+            guided = spherical_harmonic_exchange(
+                predicted_pc=pred_np,
+                reference_pc=ref_np,
                 lmax=self.lmax,
                 sigma=self.sigma,
+                blend_weight=self.blend_weight,
                 target_size=self.target_size or num_points,
                 device=str(device),
             )
-            guided_points.append(torch.from_numpy(smoothed))
+            guided_points.append(torch.from_numpy(guided))
 
         guided_points = torch.stack(guided_points, dim=0).to(device=device, dtype=dtype)
-
-        blend = self.blend_weight if self.blend_weight is not None else 0.5
-        blend_tensor = predicted_points.new_full((batch_size, 1, 1), float(blend))
-        return predicted_points + blend_tensor * (guided_points - predicted_points)
-
-
-# ---------------------------------------------------------------------------
+        return guided_points

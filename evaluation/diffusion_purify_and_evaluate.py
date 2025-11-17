@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from models.autoencoder import AutoEncoder
 from models.dgcnn import build_dgcnn_classifier
 from models.diffusion_sampler import DiffusionSampler
-from utils.graph_frequency import GraphFrequencyGuidance
+from utils.spherical_harmonics import SphericalHarmonicGuidance
 from utils.modelnet40 import ModelNet40
 from .datasets import AdversarialExamplesDataset
 
@@ -213,20 +213,19 @@ def load_autoencoder(ckpt_path: Path, device: torch.device) -> AutoEncoder:
 
 def build_sampler(
     autoencoder: AutoEncoder,
-    sht_lmax: int,
-    sht_sigma: float,
-    guidance_blend: Optional[float],
-    forward_noise_steps: Optional[int],
+    args: argparse.Namespace,
 ) -> DiffusionSampler:
-    frequency_guidance = GraphFrequencyGuidance(
-        lmax=sht_lmax, sigma=sht_sigma, blend_weight=guidance_blend
+    frequency_guidance = SphericalHarmonicGuidance(
+        lmax=args.sht_lmax,
+        sigma=args.sht_sigma,
+        blend_weight=args.guidance_blend,
     )
 
     sampler = DiffusionSampler(
         model=autoencoder.diffusion.net,
         var_sched=autoencoder.diffusion.var_sched,
         frequency_guidance=frequency_guidance,
-        forward_noise_steps=forward_noise_steps,
+        forward_noise_steps=args.forward_noise_steps,
     )
     autoencoder.diffusion.net.eval()
     return sampler
@@ -363,13 +362,7 @@ def main() -> None:
     classifier = load_classifier(args.weights, device)
     autoencoder = load_autoencoder(args.ae_checkpoint, device)
 
-    sampler = build_sampler(
-        autoencoder=autoencoder,
-        sht_lmax=args.sht_lmax,
-        sht_sigma=args.sht_sigma,
-        guidance_blend=args.guidance_blend,
-        forward_noise_steps=args.forward_noise_steps,
-    )
+    sampler = build_sampler(autoencoder=autoencoder, args=args)
 
     context_field = args.context_field if args.context_field is not None else args.input_field
 
