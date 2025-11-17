@@ -1,4 +1,4 @@
-"""Diffusion sampler with frequency-domain guidance for point clouds."""
+"""Diffusion sampler with graph-frequency guidance for point clouds."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from .diffusion import VarianceSchedule
+from utils.graph_frequency import GraphFrequencyGuidance
 
 
 class DiffusionSampler:
@@ -17,7 +18,7 @@ class DiffusionSampler:
         self,
         model,
         var_sched: VarianceSchedule,
-        frequency_guidance: nn.Module,
+        frequency_guidance: GraphFrequencyGuidance,
         forward_noise_steps: Optional[int] = None,
     ) -> None:
         self.model = model

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from models.autoencoder import AutoEncoder
 from models.dgcnn import build_dgcnn_classifier
 from models.diffusion_sampler import DiffusionSampler
-from utils.spherical_harmonics import SphericalHarmonicGuidance
+from utils.graph_frequency import GraphFrequencyGuidance
 from utils.modelnet40 import ModelNet40
 from .datasets import AdversarialExamplesDataset
 
@@ -76,19 +76,57 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint produced by train_ae.py containing the diffusion model.",
     )
     parser.add_argument(
-        "--sht-lmax",
+        "--graph-k",
         type=int,
-        default=32,
-        help="Maximum spherical harmonic degree used for the projection (default: 32).",
+        default=16,
+        help="Number of neighbours used to build the k-NN graph (default: 16).",
     )
     parser.add_argument(
-        "--sht-sigma",
+        "--lowpass-ratio",
         type=float,
-        default=1.5,
+        default=0.125,
         help=(
-            "Gaussian sigma controlling the low-pass filter applied in the spherical "
-            "harmonics domain."
+            "Fraction (or absolute count when >= 1) of graph Fourier modes "
+            "replaced with the reference signal."
         ),
+    )
+    parser.add_argument(
+        "--lowpass-bands",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional sequence of cumulative ratios/counts to split the low "
+            "frequencies into finer bands (e.g. 0.05 0.1 0.2)."
+        ),
+    )
+    parser.add_argument(
+        "--band-weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional per-band strengths applied to amplitude/phase mixing. "
+            "Must match the number of provided --lowpass-bands."
+        ),
+    )
+    parser.add_argument(
+        "--gft-bandwidth",
+        type=float,
+        default=None,
+        help="Optional Gaussian bandwidth controlling edge weights in the graph.",
+    )
+    parser.add_argument(
+        "--amplitude-weight",
+        type=float,
+        default=1.0,
+        help="Global scaling for amplitude replacement within low-frequency bands.",
+    )
+    parser.add_argument(
+        "--phase-weight",
+        type=float,
+        default=1.0,
+        help="Global scaling for phase projection within low-frequency bands.",
     )
     parser.add_argument(
         "--guidance-blend",
@@ -213,12 +251,25 @@ def load_autoencoder(ckpt_path: Path, device: torch.device) -> AutoEncoder:
 
 def build_sampler(
     autoencoder: AutoEncoder,
-    args: argparse.Namespace,
+    graph_k: int,
+    lowpass_ratio: float,
+    lowpass_bands: Optional[List[float]],
+    band_weights: Optional[List[float]],
+    guidance_blend: Optional[float],
+    gft_bandwidth: Optional[float],
+    amplitude_weight: float,
+    phase_weight: float,
+    forward_noise_steps: Optional[int],
 ) -> DiffusionSampler:
-    frequency_guidance = SphericalHarmonicGuidance(
-        lmax=args.sht_lmax,
-        sigma=args.sht_sigma,
-        blend_weight=args.guidance_blend,
+    frequency_guidance = GraphFrequencyGuidance(
+        k=graph_k,
+        lowpass_ratio=lowpass_ratio,
+        lowpass_bands=lowpass_bands,
+        band_weights=band_weights,
+        bandwidth=gft_bandwidth,
+        blend_weight=guidance_blend,
+        amplitude_weight=amplitude_weight,
+        phase_weight=phase_weight,
     )
 
     sampler = DiffusionSampler(
@@ -362,7 +413,18 @@ def main() -> None:
     classifier = load_classifier(args.weights, device)
     autoencoder = load_autoencoder(args.ae_checkpoint, device)
 
-    sampler = build_sampler(autoencoder=autoencoder, args=args)
+    sampler = build_sampler(
+        autoencoder=autoencoder,
+        graph_k=args.graph_k,
+        lowpass_ratio=args.lowpass_ratio,
+        lowpass_bands=args.lowpass_bands,
+        band_weights=args.band_weights,
+        guidance_blend=args.guidance_blend,
+        gft_bandwidth=args.gft_bandwidth,
+        amplitude_weight=args.amplitude_weight,
+        phase_weight=args.phase_weight,
+        forward_noise_steps=args.forward_noise_steps,
+    )
 
     context_field = args.context_field if args.context_field is not None else args.input_field
 
