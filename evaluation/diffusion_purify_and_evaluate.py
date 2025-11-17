@@ -76,25 +76,19 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint produced by train_ae.py containing the diffusion model.",
     )
     parser.add_argument(
-        "--graph-k",
+        "--sht-lmax",
         type=int,
-        default=16,
-        help="Number of neighbours used to build the k-NN graph (default: 16).",
+        default=32,
+        help="Maximum spherical harmonic degree used for the projection (default: 32).",
     )
     parser.add_argument(
-        "--lowpass-ratio",
+        "--sht-sigma",
         type=float,
-        default=0.125,
+        default=1.5,
         help=(
-            "Fraction (or absolute count when >= 1) of graph Fourier modes "
-            "replaced with the reference signal."
+            "Gaussian sigma controlling the low-pass filter applied in the spherical "
+            "harmonics domain."
         ),
-    )
-    parser.add_argument(
-        "--gft-bandwidth",
-        type=float,
-        default=None,
-        help="Optional Gaussian bandwidth controlling edge weights in the graph.",
     )
     parser.add_argument(
         "--guidance-blend",
@@ -219,17 +213,13 @@ def load_autoencoder(ckpt_path: Path, device: torch.device) -> AutoEncoder:
 
 def build_sampler(
     autoencoder: AutoEncoder,
-    graph_k: int,
-    lowpass_ratio: float,
+    sht_lmax: int,
+    sht_sigma: float,
     guidance_blend: Optional[float],
-    gft_bandwidth: Optional[float],
     forward_noise_steps: Optional[int],
 ) -> DiffusionSampler:
     frequency_guidance = GraphFrequencyGuidance(
-        k=graph_k,
-        lowpass_ratio=lowpass_ratio,
-        bandwidth=gft_bandwidth,
-        blend_weight=guidance_blend,
+        lmax=sht_lmax, sigma=sht_sigma, blend_weight=guidance_blend
     )
 
     sampler = DiffusionSampler(
@@ -375,10 +365,9 @@ def main() -> None:
 
     sampler = build_sampler(
         autoencoder=autoencoder,
-        graph_k=args.graph_k,
-        lowpass_ratio=args.lowpass_ratio,
+        sht_lmax=args.sht_lmax,
+        sht_sigma=args.sht_sigma,
         guidance_blend=args.guidance_blend,
-        gft_bandwidth=args.gft_bandwidth,
         forward_noise_steps=args.forward_noise_steps,
     )
 
