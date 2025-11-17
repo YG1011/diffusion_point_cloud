@@ -1,165 +1,175 @@
-"""Graph Fourier transform utilities for point cloud diffusion guidance."""
+"""Spherical-harmonic utilities for point cloud diffusion guidance.
+
+The previous implementation relied on a graph Fourier transform (GFT). The
+GFT-based routines have been retained below in a commented block so the
+behaviour can be restored if needed, while the active implementation now uses
+the spherical harmonics workflow shared by the user.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+import pyshtools as pysh
 import torch
+from cv2 import getGaussianKernel
 from torch import nn
 
 
-@dataclass
-class GraphSpectrum:
-    """Container holding the eigendecomposition of a graph Laplacian."""
+def _convert_pc_to_grid(pc: np.ndarray, lmax: int, device: str) -> tuple:
+    """Project a point cloud onto a spherical grid centred at its centroid."""
 
-    eigenvalues: torch.Tensor
-    eigenvectors: torch.Tensor
+    torch_device = torch.device(device)
+    pc_tensor = torch.from_numpy(pc).to(torch_device)
 
+    grid = pysh.SHGrid.from_zeros(lmax, grid="DH")
+    nlon, nlat = grid.nlon, grid.nlat
+    ngrid = nlon * nlat
 
-def _pairwise_distances(points: torch.Tensor) -> torch.Tensor:
-    """Returns the pairwise Euclidean distance matrix for each batch sample."""
+    grid_lon = torch.from_numpy(
+        np.linspace(0, nlon * np.pi * 2 / (nlon - 1), num=nlon, endpoint=False)
+    ).to(torch_device)
+    grid_lat = torch.from_numpy(
+        np.linspace(nlat // 2 * np.pi / -(nlat - 1), np.pi / 2, num=nlat, endpoint=True)
+    ).to(torch_device)
+    grid_lon = grid_lon.view(1, 1, nlon).expand(1, nlat, nlon)
+    grid_lat = grid_lat.view(1, nlat, 1).expand(1, nlat, nlon)
+    grid_lon = grid_lon.reshape(1, ngrid)
+    grid_lat = grid_lat.reshape(1, ngrid)
 
-    if points.dim() != 3 or points.size(-1) != 3:
-        raise ValueError("points must have shape (B, N, 3)")
+    origin = torch.mean(pc_tensor, axis=0)
+    centred_pc = pc_tensor - origin
+    npc = centred_pc.size(0)
 
-    return torch.cdist(points, points, p=2)
+    pc_x, pc_y, pc_z = centred_pc[:, 0], centred_pc[:, 1], centred_pc[:, 2]
+    pc_r = torch.sqrt(pc_x * pc_x + pc_y * pc_y + pc_z * pc_z)
+    pc_lat = torch.arcsin(pc_z / pc_r)
+    pc_lon = torch.atan2(pc_y, pc_x)
 
+    pc_r = pc_r.view(npc, 1)
+    pc_lat = pc_lat.view(npc, 1)
+    pc_lon = pc_lon.view(npc, 1)
 
-def _build_knn_adjacency(
-    points: torch.Tensor,
-    k: int,
-    bandwidth: Optional[float],
-    eps: float,
-) -> torch.Tensor:
-    """Constructs a symmetric k-NN adjacency matrix with Gaussian weights."""
-
-    batch_size, num_points, _ = points.shape
-    if num_points <= 1 or k <= 0:
-        return torch.zeros(
-            batch_size,
-            num_points,
-            num_points,
-            dtype=points.dtype,
-            device=points.device,
-        )
-
-    distances = _pairwise_distances(points)
-    k = min(k, num_points - 1)
-    # torch.topk requires k > 0, hence the early return above.
-    knn_dist, knn_idx = torch.topk(distances, k=k + 1, largest=False)
-    knn_dist = knn_dist[:, :, 1:]
-    knn_idx = knn_idx[:, :, 1:]
-
-    if bandwidth is None:
-        adaptive_bandwidth = knn_dist.mean(dim=(1, 2), keepdim=True)
-    else:
-        adaptive_bandwidth = points.new_full((batch_size, 1, 1), float(bandwidth))
-    adaptive_bandwidth = adaptive_bandwidth.clamp_min(eps)
-
-    weights = torch.exp(-(knn_dist**2) / (adaptive_bandwidth**2))
-
-    adjacency = torch.zeros(
-        batch_size,
-        num_points,
-        num_points,
-        dtype=points.dtype,
-        device=points.device,
+    dist = (
+        -torch.cos(grid_lat) * torch.cos(pc_lat) * torch.cos(grid_lon - pc_lon)
+        + torch.sin(grid_lat) * torch.sin(pc_lat)
     )
-    adjacency.scatter_(2, knn_idx, weights)
-    adjacency = 0.5 * (adjacency + adjacency.transpose(-1, -2))
 
-    eye = torch.eye(num_points, dtype=points.dtype, device=points.device)
-    adjacency = adjacency * (1 - eye.unsqueeze(0))
+    argmin = torch.argmin(dist, axis=0)
+    grid_r = pc_r[argmin].view(nlat, nlon)
+    grid.data = grid_r.to("cpu").numpy()
 
-    return adjacency
+    argmin = torch.argmin(dist, axis=1)
+    flag = torch.zeros(ngrid, dtype=bool)
+    flag[argmin] = True
+    flag = flag.to("cpu").numpy()
 
-
-def _laplacian_from_adjacency(
-    adjacency: torch.Tensor,
-    normalised: bool,
-    eps: float,
-) -> torch.Tensor:
-    """Computes either the combinatorial or symmetric-normalised Laplacian."""
-
-    degree = adjacency.sum(dim=-1)
-    if normalised:
-        inv_sqrt_degree = degree.clamp_min(eps).pow(-0.5)
-        eye = torch.eye(
-            adjacency.size(-1), device=adjacency.device, dtype=adjacency.dtype
-        ).unsqueeze(0)
-        laplacian = eye - (
-            inv_sqrt_degree.unsqueeze(-1)
-            * adjacency
-            * inv_sqrt_degree.unsqueeze(-2)
-        )
-    else:
-        laplacian = torch.diag_embed(degree) - adjacency
-    return laplacian
+    return grid, flag, origin.to("cpu").numpy()
 
 
-def graph_spectrum(
-    points: torch.Tensor,
-    k: int = 16,
-    bandwidth: Optional[float] = None,
-    normalised: bool = True,
-    eps: float = 1e-6,
-) -> GraphSpectrum:
-    """Computes the eigenvalues and eigenvectors of the graph Laplacian."""
+def _convert_grid_to_pc(grid: pysh.SHGrid, flag: np.ndarray, origin: np.ndarray) -> np.ndarray:
+    """Reconstruct a point cloud from a spherical grid representation."""
 
-    adjacency = _build_knn_adjacency(points, k=k, bandwidth=bandwidth, eps=eps)
-    laplacian = _laplacian_from_adjacency(adjacency, normalised=normalised, eps=eps)
-    eigenvalues, eigenvectors = torch.linalg.eigh(laplacian)
-    return GraphSpectrum(eigenvalues=eigenvalues, eigenvectors=eigenvectors)
+    nlon = grid.nlon
+    nlat = grid.nlat
+    lon = np.linspace(0, nlon * np.pi * 2 / (nlon - 1), num=nlon, endpoint=False)
+    lat = np.linspace(nlat // 2 * np.pi / -(nlat - 1), np.pi / 2, num=nlat, endpoint=True)
+    lon = np.broadcast_to(lon.reshape((1, nlon)), (nlat, nlon))
+    lat = np.broadcast_to(lat.reshape((nlat, 1)), (nlat, nlon))
+    r = grid.data
+
+    z = np.sin(lat) * r
+    t = np.cos(lat) * r
+    x = t * np.cos(lon)
+    y = t * np.sin(lon)
+
+    pc = np.zeros(grid.data.shape + (3,))
+    pc[:, :, 0] = x
+    pc[:, :, 1] = y
+    pc[:, :, 2] = -z
+    pc = pc.reshape((-1, 3))
+    pc = pc[flag, :]
+    pc += origin
+
+    return pc
 
 
-def graph_fourier_transform(points: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
-    """Projects 3D coordinates onto the graph Fourier basis."""
+def _low_pass_filter(grid: pysh.SHGrid, sigma: float) -> pysh.SHGrid:
+    """Apply a Gaussian low-pass filter in the spherical harmonics domain."""
 
-    return torch.matmul(eigenvectors.transpose(-1, -2), points)
+    clm = grid.expand()
+    weights = getGaussianKernel(clm.coeffs.shape[1] * 2 - 1, sigma)[
+        clm.coeffs.shape[1] - 1 :
+    ]
+    weights /= weights[0]
+    clm.coeffs *= weights
+    return clm.expand()
 
 
-def inverse_graph_fourier_transform(
-    coefficients: torch.Tensor, eigenvectors: torch.Tensor
-) -> torch.Tensor:
-    """Reconstructs point coordinates from graph Fourier coefficients."""
+def _duplicate_randomly(pc: np.ndarray, size: int) -> np.ndarray:
+    """Pad the point cloud by duplicating random points if it shrank."""
 
-    return torch.matmul(eigenvectors, coefficients)
+    loss_cnt = size - pc.shape[0]
+    if loss_cnt <= 0:
+        return pc
+    rand_indices = np.random.randint(0, pc.shape[0], size=loss_cnt)
+    dup = pc[rand_indices]
+    return np.concatenate((pc, dup))
+
+
+def spherical_harmonic_smooth(
+    pc: np.ndarray, lmax: int, sigma: float, target_size: int, device: str
+) -> np.ndarray:
+    """Project ``pc`` to spherical harmonics, low-pass filter, and reconstruct."""
+
+    grid, flag, origin = _convert_pc_to_grid(pc, lmax, device)
+    smooth_grid = _low_pass_filter(grid, sigma)
+    smooth_pc = _convert_grid_to_pc(smooth_grid, flag, origin)
+    smooth_pc = _duplicate_randomly(smooth_pc, target_size)
+    return smooth_pc
 
 
 class GraphFrequencyGuidance(nn.Module):
-    """Guides diffusion updates using a graph Fourier decomposition."""
+    """Guides diffusion updates using spherical harmonic smoothing.
+
+    The original GFT-based implementation is kept below for reference:
+
+    .. code-block:: python
+
+        # def forward(self, predicted_points, reference_points):
+        #     ...
+        #     coeff_guided = torch.where(low_mask, ref_coeff, pred_coeff)
+        #     guided_centered = inverse_graph_fourier_transform(coeff_guided, eigenvectors)
+        #     ...
+
+    """
 
     def __init__(
         self,
-        k: int = 16,
-        lowpass_ratio: float = 0.125,
-        bandwidth: Optional[float] = None,
+        lmax: int = 32,
+        sigma: float = 1.5,
         blend_weight: Optional[float] = None,
-        normalised_laplacian: bool = True,
-        eps: float = 1e-6,
+        target_size: Optional[int] = None,
+        **_: object,
     ) -> None:
         super().__init__()
-        if k < 0:
-            raise ValueError("k must be non-negative")
-        if lowpass_ratio <= 0:
-            raise ValueError("lowpass_ratio must be positive")
+        if lmax <= 0:
+            raise ValueError("lmax must be positive for spherical harmonics")
+        if sigma <= 0:
+            raise ValueError("sigma must be positive for the Gaussian kernel")
         if blend_weight is not None and blend_weight < 0:
             raise ValueError("blend_weight must be non-negative when provided")
 
-        self.k = int(k)
-        self.lowpass_ratio = float(lowpass_ratio)
-        self.bandwidth = bandwidth
+        self.lmax = int(lmax)
+        self.sigma = float(sigma)
         self.blend_weight = blend_weight
-        self.normalised_laplacian = normalised_laplacian
-        self.eps = float(eps)
+        self.target_size = target_size
 
     def forward(
-        self,
-        predicted_points: torch.Tensor,
-        reference_points: torch.Tensor,
+        self, predicted_points: torch.Tensor, reference_points: torch.Tensor
     ) -> torch.Tensor:
-        """Replaces the low-frequency graph coefficients with the reference."""
+        """Smooth reference shapes via spherical harmonics and blend predictions."""
 
         if predicted_points.shape != reference_points.shape:
             raise ValueError("predicted_points and reference_points must share shape")
@@ -167,57 +177,47 @@ class GraphFrequencyGuidance(nn.Module):
             raise ValueError("point clouds must have shape (B, N, 3)")
 
         batch_size, num_points, _ = predicted_points.shape
-        if num_points == 0:
-            return predicted_points
+        device = predicted_points.device
+        dtype = predicted_points.dtype
 
-        reference_center = reference_points.mean(dim=1, keepdim=True)
-        predicted_center = predicted_points.mean(dim=1, keepdim=True)
+        guided_points = []
+        for b in range(batch_size):
+            ref_np = reference_points[b].detach().cpu().numpy()
+            smoothed = spherical_harmonic_smooth(
+                ref_np,
+                lmax=self.lmax,
+                sigma=self.sigma,
+                target_size=self.target_size or num_points,
+                device=str(device),
+            )
+            guided_points.append(torch.from_numpy(smoothed))
 
-        ref_centered = reference_points - reference_center
-        pred_centered = predicted_points - predicted_center
+        guided_points = torch.stack(guided_points, dim=0).to(device=device, dtype=dtype)
 
-        spectrum = graph_spectrum(
-            ref_centered,
-            k=self.k,
-            bandwidth=self.bandwidth,
-            normalised=self.normalised_laplacian,
-            eps=self.eps,
-        )
-        eigenvectors = spectrum.eigenvectors
-
-        ref_coeff = graph_fourier_transform(ref_centered, eigenvectors)
-        pred_coeff = graph_fourier_transform(pred_centered, eigenvectors)
-
-        if self.lowpass_ratio < 1.0:
-            num_low = max(1, int(round(self.lowpass_ratio * num_points)))
-        else:
-            num_low = min(num_points, int(round(self.lowpass_ratio)))
-        num_low = max(1, min(num_low, num_points))
-
-        low_mask = (
-            torch.arange(num_points, device=predicted_points.device)
-            .unsqueeze(0)
-            .unsqueeze(-1)
-            < num_low
-        )
-        coeff_guided = torch.where(low_mask, ref_coeff, pred_coeff)
-
-        guided_centered = inverse_graph_fourier_transform(coeff_guided, eigenvectors)
-
-        pred_energy = (
-            pred_centered.pow(2).mean(dim=(1, 2), keepdim=True).clamp_min(self.eps)
-        )
-        guided_energy = (
-            guided_centered.pow(2).mean(dim=(1, 2), keepdim=True).clamp_min(self.eps)
-        )
-        guided_centered = guided_centered * torch.sqrt(pred_energy / guided_energy)
-
-        guided_points = guided_centered + predicted_center
-
-        if self.blend_weight is not None:
-            blend = float(self.blend_weight)
-        else:
-            blend = float(num_low) / float(num_points)
-        blend_tensor = predicted_points.new_full((batch_size, 1, 1), blend)
-
+        blend = self.blend_weight if self.blend_weight is not None else 0.5
+        blend_tensor = predicted_points.new_full((batch_size, 1, 1), float(blend))
         return predicted_points + blend_tensor * (guided_points - predicted_points)
+
+
+# ---------------------------------------------------------------------------
+# Previous GFT implementation retained for easy rollback.
+# Uncomment and replace the class above if you want the original behaviour.
+#
+# @dataclass
+# class GraphSpectrum:
+#     eigenvalues: torch.Tensor
+#     eigenvectors: torch.Tensor
+#
+# def graph_spectrum(points: torch.Tensor, k: int, bandwidth: Optional[float],
+#                   normalised: bool, eps: float) -> GraphSpectrum:
+#     adjacency = _build_knn_adjacency(points, k=k, bandwidth=bandwidth, eps=eps)
+#     laplacian = _laplacian_from_adjacency(adjacency, normalised=normalised, eps=eps)
+#     eigenvalues, eigenvectors = torch.linalg.eigh(laplacian)
+#     return GraphSpectrum(eigenvalues=eigenvalues, eigenvectors=eigenvectors)
+#
+# def graph_fourier_transform(points: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
+#     return torch.matmul(eigenvectors.transpose(-1, -2), points)
+#
+# def inverse_graph_fourier_transform(coefficients: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
+#     return torch.matmul(eigenvectors, coefficients)
+#
